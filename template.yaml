@@ -389,6 +389,6 @@ Resources:
       UserPoolId: !Ref CognitoUserPool
 
 Outputs:
-  APIDistributionId:
+  RestApiUrl:
     Description: URL of the REST endpoint
     Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${stageName}/"
