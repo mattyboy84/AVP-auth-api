@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform:
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  stageName:
+    Type: String
+    Default: 'v1'
+  Namespace:
+    Type: String
+
+Globals:
+  Function:
+    MemorySize: 3008
+    Timeout: 900
+    CodeUri: ./
+    Runtime: nodejs20.x 
+    Environment:
+      Variables:
+        POLICY_STORE_ID: !Ref policyStore
+        NAMESPACE: !Ref Namespace
+
+Resources:
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+  lambdaAuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaAuthorizerRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-lambdaAuthorizerRole"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: Allow
+                Action: "verifiedpermissions:IsAuthorizedWithToken"
+                Resource: !Sub "arn:aws:verifiedpermissions::${AWS::AccountId}:policy-store/${policyStore}"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+  policyStore:
+    Type: AWS::VerifiedPermissions::PolicyStore
+    Properties:
+      Description: test policy store
+      Schema:
+        CedarJson: !Sub "{\"${Namespace}\": {\"entityTypes\": {\"User\": {\"shape\": {\"type\": \"Record\",\"attributes\": {}},\"memberOfTypes\": [\"UserGroup\"]},\"UserGroup\": {\"shape\": {\"type\": \"Record\",\"attributes\": {}}},\"Application\": {\"shape\": {\"type\": \"Record\",\"attributes\": {}}}},\"actions\": {\"post /read\": {\"appliesTo\": {\"context\": {\"type\": \"Record\",\"attributes\": {}},\"principalTypes\": [\"User\"],\"resourceTypes\": [\"Application\"]}},\"post /write\": {\"appliesTo\": {\"context\": {\"type\": \"Record\",\"attributes\": {}},\"principalTypes\": [\"User\"],\"resourceTypes\": [\"Application\"]}}}}}"
+      ValidationSettings:
+        Mode: "OFF"
+  
+  cognitoIdentityStore:
+    Type: AWS::VerifiedPermissions::IdentitySource
+    Properties:
+      Configuration: 
+        CognitoUserPoolConfiguration: 
+          GroupConfiguration: 
+            GroupEntityType: !Sub "${Namespace}::UserGroup"
+          UserPoolArn: !GetAtt CognitoUserPool.Arn
+      PolicyStoreId: !Ref policyStore
+      PrincipalEntityType: !Sub "${Namespace}::User"
+  
+  writeAccess:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      Definition: 
+        Static:
+          Description: write access
+          Statement: !Sub |
+            permit (
+              principal in
+                ${Namespace}::UserGroup::"${CognitoUserPool}|${CognitoUserPoolWriteAccessGroup}",
+              action in [${Namespace}::Action::"post /write"],
+              resource
+            );
+      PolicyStoreId: !Ref policyStore
+  
+  readAccess:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      Definition: 
+        Static:
+          Description: read access
+          Statement: !Sub |
+            permit (
+              principal in
+                ${Namespace}::UserGroup::"${CognitoUserPool}|${CognitoUserPoolReadAccessGroup}",
+              action in [${Namespace}::Action::"post /read"],
+              resource
+            );
+      PolicyStoreId: !Ref policyStore
+  
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      DisableExecuteApiEndpoint: false
+  
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref stageName
+      DeploymentId: !Ref Deployment
+      TracingEnabled: true
+  
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+    DependsOn:
+      - readMethod
+      - writeMethod
+  
+  authorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-authorizerFunction"
+      Role: !GetAtt lambdaAuthorizerRole.Arn
+      Handler: src/authorize.handler
+  
+  authorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref authorizerFunction]]
+  
+  authorizerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt authorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+  
+  lambdaAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub "${AWS::StackName}-lambdaAuthorizer"
+      RestApiId: !Ref RestApi
+      Type: REQUEST
+      AuthorizerCredentials: !GetAtt lambdaAuthorizerRole.Arn
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${authorizerFunction}/invocations"
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization,context.httpMethod,context.path
+  
+  readResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: read
+  
+  readMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      OperationName: read route
+      ApiKeyRequired: false
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref lambdaAuthorizer
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${readFunction}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        IntegrationResponses:
+          - StatusCode: '200'
+      MethodResponses:
+        - StatusCode: 200
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt readResource.ResourceId
+  
+  readFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-readFunction"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: src/read.handler
+  
+  readFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref readFunction]]
+  
+  readMethodFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt readFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
+  
+  writeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: write
+  
+  writeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      OperationName: write route
+      ApiKeyRequired: false
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref lambdaAuthorizer
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${writeFunction}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        IntegrationResponses:
+          - StatusCode: '200'
+      MethodResponses:
+        - StatusCode: 200
+      RestApiId: !Ref RestApi
+      ResourceId: !GetAtt writeResource.ResourceId
+  
+  writeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-writeFunction"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: src/write.handler
+  
+  writeFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref writeFunction]]
+  
+  writeMethodFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt writeFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*"
+  
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-UserPool"
+      UsernameAttributes: 
+        - email
+      AutoVerifiedAttributes:
+        - email
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+  
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-UserPoolClient"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 2
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: hours
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      ReadAttributes:
+        - address
+        - birthdate
+        - email
+        - email_verified
+        - family_name
+        - gender
+        - given_name
+        - locale
+        - middle_name
+        - name
+        - nickname
+        - phone_number
+        - phone_number_verified
+        - picture
+        - preferred_username
+        - profile
+        - updated_at
+        - website
+        - zoneinfo
+      WriteAttributes:
+        - address
+        - birthdate
+        - email
+        - family_name
+        - gender
+        - given_name
+        - locale
+        - middle_name
+        - name
+        - nickname
+        - phone_number
+        - picture
+        - preferred_username
+        - profile
+        - updated_at
+        - website
+        - zoneinfo
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - http://localhost:8080/api/auth/callback/cognito
+        - https://oauth.pstmn.io/v1/browser-callback
+      LogoutURLs:
+        - http://localhost:8080/api/auth/callback/cognito
+        - https://oauth.pstmn.io/v1/browser-callback
+      AllowedOAuthScopes:
+        - aws.cognito.signin.user.admin
+        - email
+        - openid
+        - phone
+        - profile
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthFlowsUserPoolClient: True
+  
+  CognitoCustomDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Domain: !Sub "${AWS::StackName}"
+  
+  CognitoUserPoolReadAccessGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ReadAccess
+      UserPoolId: !Ref CognitoUserPool
+  
+  CognitoUserPoolWriteAccessGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: WriteAccess
+      UserPoolId: !Ref CognitoUserPool
+
+Outputs:
+  APIDistributionId:
+    Description: URL of the REST endpoint
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${stageName}/"

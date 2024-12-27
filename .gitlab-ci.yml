@@ -1,0 +1,16 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deploy
+
+variables:
+  STACK_NAME: avp-auth-api
+  REGION: eu-west-2
+  NAMESPACE: verifiedpermissionsdemo
+
+deploy:
+  stage: deploy
+  script:
+    - sam build
+    - sam package --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides Namespace=$NAMESPACE
